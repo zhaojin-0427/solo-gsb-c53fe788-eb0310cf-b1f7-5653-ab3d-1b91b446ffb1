@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import heapq
 import os
+from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -302,9 +303,19 @@ def _recompute_baselines(conn: Connection, device_id: str,
 def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dict]:
     """Rebuild all current alerts for one device from its hit verdicts.
 
-    Hits ordered by event time (sample_id as tie-break) form runs; adjacent hits
-    more than 5 minutes apart split runs. An alert id is the first hit's
-    sample id. Emits created/updated/revoked change rows for the diff.
+    Hits ordered by (event_time, sample_id) — event time first, sample id as
+    the same-second tie-break — form runs. Two adjacent hits merge only when
+    they are at most 5 minutes apart AND no non-hit (normal/unknown) reading
+    sorts between them in that same order; an intervening non-hit always
+    splits runs. An alert id is the first hit's sample id.
+
+    Strategy: instead of scanning the device's full reading sequence, fetch
+    only the hits, plus the non-hits falling between the first and last hit
+    of mergeable (<= 5 min apart) adjacent pairs. Pairs further apart split
+    regardless of intervening readings, so non-hits outside those spans can
+    never change the result — and on hit-free append-only workloads this
+    issues no extra query at all. Emits created/updated/revoked change rows
+    for the diff.
     """
     hits = conn.execute(
         """
@@ -316,9 +327,43 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
         (device_id,),
     ).fetchall()
 
+    # Span covering every mergeable adjacent hit pair.
+    span_lo: Optional[tuple] = None
+    span_hi: Optional[tuple] = None
+    for prev, cur in zip(hits, hits[1:]):
+        if cur["event_time"] - prev["event_time"] <= MERGE_GAP:
+            lo_key = (prev["event_time"], prev["sample_id"])
+            hi_key = (cur["event_time"], cur["sample_id"])
+            if span_lo is None or lo_key < span_lo:
+                span_lo = lo_key
+            if span_hi is None or hi_key > span_hi:
+                span_hi = hi_key
+
+    sep_keys: list[tuple] = []
+    if span_lo is not None:
+        seps = conn.execute(
+            """
+            SELECT event_time, sample_id
+              FROM readings
+             WHERE device_id = %s AND verdict <> 'hit'
+               AND (event_time, sample_id) >= (%s, %s)
+               AND (event_time, sample_id) <= (%s, %s)
+             ORDER BY event_time, sample_id
+            """,
+            (device_id, span_lo[0], span_lo[1], span_hi[0], span_hi[1]),
+        ).fetchall()
+        sep_keys = [(s["event_time"], s["sample_id"]) for s in seps]
+
     runs: list[dict] = []
+    prev_key: Optional[tuple] = None
     for h in hits:
-        if runs and h["event_time"] - runs[-1]["ends_at"] <= MERGE_GAP:
+        h_key = (h["event_time"], h["sample_id"])
+        merge = False
+        if prev_key is not None and h["event_time"] - prev_key[0] <= MERGE_GAP:
+            # Mergeable by gap; blocked iff a non-hit sorts strictly between.
+            i = bisect_right(sep_keys, prev_key)
+            merge = i == len(sep_keys) or sep_keys[i] >= h_key
+        if merge:
             run = runs[-1]
             run["last_sample_id"] = h["sample_id"]
             run["ends_at"] = h["event_time"]
@@ -334,6 +379,7 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
                 "hit_count": 1,
                 "max_amplitude": float(h["amplitude"]),
             })
+        prev_key = h_key
 
     current = {r["alert_id"]: r for r in runs}
     existing_rows = conn.execute(

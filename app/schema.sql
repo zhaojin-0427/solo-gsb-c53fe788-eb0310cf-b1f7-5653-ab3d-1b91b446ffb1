@@ -17,6 +17,13 @@ CREATE INDEX IF NOT EXISTS readings_device_time_idx
     ON readings (device_id, event_time, sample_id)
     INCLUDE (amplitude);
 
+-- alert rebuild reads only hits; stays empty (and free to maintain) while a
+-- device has no hits, so pure-append workloads pay nothing for it
+CREATE INDEX IF NOT EXISTS readings_hit_idx
+    ON readings (device_id, event_time, sample_id)
+    INCLUDE (amplitude)
+    WHERE verdict = 'hit';
+
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id          TEXT        NOT NULL,           -- sample_id of first hit
     device_id         TEXT        NOT NULL,
