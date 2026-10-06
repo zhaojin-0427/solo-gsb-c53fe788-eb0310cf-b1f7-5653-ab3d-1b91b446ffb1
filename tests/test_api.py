@@ -105,6 +105,186 @@ def test_merging_only_adjacent_hits_within_5min(client):
     assert alerts[0]["hit_count"] == 4
 
 
+def test_normal_between_hits_splits_alert_and_changes(client):
+    dev = new_device()
+    # 25 calm readings 1/sec -> stable baseline 1.0
+    calm = [{"sample_id": f"q{i:02d}", "rev": 0, "event_time": ts(25 + i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    # two hits only 100 s apart, but a normal reading sits between them:
+    # they must NOT merge
+    r = post(client, dev, [
+        {"sample_id": "hA", "rev": 0, "event_time": ts(100), "amplitude": 10.0},
+        {"sample_id": "sep", "rev": 0, "event_time": ts(150), "amplitude": 1.0},
+        {"sample_id": "hB", "rev": 0, "event_time": ts(200), "amplitude": 10.0},
+    ])
+    verdicts = {x["sample_id"]: x["verdict"] for x in r.json()["results"]}
+    assert verdicts == {"hA": "hit", "sep": "normal", "hB": "hit"}
+
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [a["alert_id"] for a in alerts] == ["hA", "hB"]
+    assert all(a["hit_count"] == 1 for a in alerts)
+
+    # change stream records the split: two independent creations, no merge
+    changes = client.get("/changes", params={"device_id": dev}).json()["changes"]
+    ops = [(c["alert_id"], c["op"]) for c in changes]
+    assert ops == [("hA", "created"), ("hB", "created")]
+
+
+def test_inserting_separator_splits_existing_merged_alert(client):
+    dev = new_device()
+    calm = [{"sample_id": f"q{i:02d}", "rev": 0, "event_time": ts(25 + i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    # first the two hits merge (nothing between them yet)
+    post(client, dev, [
+        {"sample_id": "g1", "rev": 0, "event_time": ts(300), "amplitude": 10.0},
+        {"sample_id": "g2", "rev": 0, "event_time": ts(360), "amplitude": 10.0},
+    ])
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [a["alert_id"] for a in alerts] == ["g1"]
+    assert alerts[0]["hit_count"] == 2
+
+    # late-arriving normal reading between the two hits -> split
+    post(client, dev, [{"sample_id": "gsep", "rev": 0,
+                        "event_time": ts(330), "amplitude": 1.0}])
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [a["alert_id"] for a in alerts] == ["g1", "g2"]
+    assert [a["hit_count"] for a in alerts] == [1, 1]
+
+    # stream: created merged run, then g1 shrinks (updated) and g2 is created;
+    # cursor order reflects created -> updated -> created
+    changes = client.get("/changes", params={"device_id": dev}).json()["changes"]
+    ops = [(c["alert_id"], c["op"]) for c in changes]
+    assert ops == [("g1", "created"), ("g1", "updated"), ("g2", "created")]
+    snap = changes[1]["data"]
+    assert (snap["first_sample_id"], snap["last_sample_id"],
+            snap["hit_count"]) == ("g1", "g1", 1)
+
+
+def test_promoting_separator_to_hit_remerges_and_revokes(client):
+    dev = new_device()
+    calm = [{"sample_id": f"q{i:02d}", "rev": 0, "event_time": ts(25 + i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    post(client, dev, [
+        {"sample_id": "r1", "rev": 0, "event_time": ts(400), "amplitude": 10.0},
+        {"sample_id": "rsep", "rev": 0, "event_time": ts(450), "amplitude": 1.0},
+        {"sample_id": "r2", "rev": 0, "event_time": ts(500), "amplitude": 10.0},
+    ])
+    assert [a["alert_id"] for a in
+            client.get("/alerts", params={"device_id": dev}).json()["alerts"]] \
+        == ["r1", "r2"]
+
+    # higher revision turns the separator into a hit: the three re-merge into
+    # the first hit's alert; r2's standalone alert is revoked
+    r = post(client, dev, [{"sample_id": "rsep", "rev": 1,
+                            "event_time": ts(450), "amplitude": 10.0}])
+    assert by_id(r)["rsep"]["verdict"] == "hit"
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert (a["alert_id"], a["first_sample_id"], a["last_sample_id"],
+            a["hit_count"]) == ("r1", "r1", "r2", 3)
+
+    changes = client.get("/changes", params={"device_id": dev}).json()["changes"]
+    ops = [(c["alert_id"], c["op"]) for c in changes]
+    assert ops == [("r1", "created"), ("r2", "created"),
+                   ("r1", "updated"), ("r2", "revoked")]
+    # monotonic cursor: the update snapshot and revoke carry the expanded/old data
+    assert (changes[2]["data"]["last_sample_id"],
+            changes[2]["data"]["hit_count"]) == ("r2", 3)
+    assert changes[3]["data"]["first_sample_id"] == "r2"
+
+
+def test_same_second_ordered_by_sample_id_for_merge(client):
+    dev = new_device()
+    calm = [{"sample_id": f"q{i:02d}", "rev": 0, "event_time": ts(25 + i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    # same second, sample_id order: hit, normal, hit -> split
+    post(client, dev, [
+        {"sample_id": "t0", "rev": 0, "event_time": ts(600), "amplitude": 10.0},
+        {"sample_id": "t1", "rev": 0, "event_time": ts(600), "amplitude": 1.0},
+        {"sample_id": "t2", "rev": 0, "event_time": ts(600), "amplitude": 10.0},
+    ])
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [(a["alert_id"], a["hit_count"]) for a in alerts] == [
+        ("t0", 1), ("t2", 1)]
+
+    # control: two adjacent hits in the same second, nothing between -> merge
+    post(client, dev, [
+        {"sample_id": "u0", "rev": 0, "event_time": ts(150), "amplitude": 10.0},
+        {"sample_id": "u1", "rev": 0, "event_time": ts(150), "amplitude": 10.0},
+    ])
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    same_sec = [a for a in alerts if a["starts_at"] == ts(150)]
+    assert len(same_sec) == 1
+    assert (same_sec[0]["alert_id"], same_sec[0]["last_sample_id"],
+            same_sec[0]["hit_count"]) == ("u0", "u1", 2)
+
+
+def test_multiple_adjacent_pairs_mixed_separators(client):
+    """Regression for probe pair/ordinality alignment: several consecutive
+    <= 5 min hit pairs, only some of which have a reading between them."""
+    dev = new_device()
+    calm = [{"sample_id": f"m{i:02d}", "rev": 0, "event_time": ts(i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    # all hits live within one 60-minute baseline window of the calm samples:
+    # h1(120)-h2(150) adjacent -> merge; sepA(180 normal) between h2 and
+    # h3(210) -> split; h3(210) and h4(520) are 310 s apart -> split by gap;
+    # h4(520)-h5(550) adjacent -> merge
+    post(client, dev, [
+        {"sample_id": "h1", "rev": 0, "event_time": ts(120), "amplitude": 10.0},
+        {"sample_id": "h2", "rev": 0, "event_time": ts(150), "amplitude": 10.0},
+        {"sample_id": "sepA", "rev": 0, "event_time": ts(180), "amplitude": 1.0},
+        {"sample_id": "h3", "rev": 0, "event_time": ts(210), "amplitude": 10.0},
+        {"sample_id": "h4", "rev": 0, "event_time": ts(520), "amplitude": 10.0},
+        {"sample_id": "h5", "rev": 0, "event_time": ts(550), "amplitude": 10.0},
+    ])
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [(a["alert_id"], a["first_sample_id"], a["last_sample_id"],
+             a["hit_count"]) for a in alerts] == [
+        ("h1", "h1", "h2", 2),
+        ("h3", "h3", "h3", 1),
+        ("h4", "h4", "h5", 2),
+    ]
+    ops = [(c["alert_id"], c["op"]) for c in
+           client.get("/changes", params={"device_id": dev}).json()["changes"]]
+    assert ops == [("h1", "created"), ("h3", "created"), ("h4", "created")]
+
+
+def test_revision_moving_event_time_rebuilds_splits(client):
+    dev = new_device()
+    calm = [{"sample_id": f"m{i:02d}", "rev": 0, "event_time": ts(25 + i),
+             "amplitude": 1.0} for i in range(25)]
+    post(client, dev, calm)
+    # two adjacent hits merge initially
+    post(client, dev, [
+        {"sample_id": "v1", "rev": 0, "event_time": ts(500), "amplitude": 10.0},
+        {"sample_id": "v2", "rev": 0, "event_time": ts(530), "amplitude": 10.0},
+    ])
+    assert [(a["alert_id"], a["hit_count"]) for a in
+            client.get("/alerts", params={"device_id": dev}).json()["alerts"]] \
+        == [("v1", 2)]
+    # a normal sitting later than both; move v1 (rev=1) just before it so the
+    # normal now lies between v1 and v2 -> the run splits
+    post(client, dev, [{"sample_id": "w1", "rev": 0,
+                        "event_time": ts(480), "amplitude": 1.0}])
+    post(client, dev, [{"sample_id": "v1", "rev": 1,
+                        "event_time": ts(470), "amplitude": 10.0}])
+    r = post(client, dev, [{"sample_id": "v1", "rev": 1,
+                            "event_time": ts(470), "amplitude": 10.0}])
+    assert by_id(r)["v1"]["status"] == "duplicate"
+    alerts = client.get("/alerts", params={"device_id": dev}).json()["alerts"]
+    assert [(a["alert_id"], a["first_sample_id"], a["last_sample_id"],
+             a["hit_count"]) for a in alerts] == [
+        ("v1", "v1", "v1", 1),
+        ("v2", "v2", "v2", 1),
+    ]
+
+
 def test_stale_revision_ignored(client):
     dev = new_device()
     post(client, dev, [{"sample_id": "x", "rev": 2,

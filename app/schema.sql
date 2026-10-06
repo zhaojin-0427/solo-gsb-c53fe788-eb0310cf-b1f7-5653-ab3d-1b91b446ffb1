@@ -17,6 +17,12 @@ CREATE INDEX IF NOT EXISTS readings_device_time_idx
     ON readings (device_id, event_time, sample_id)
     INCLUDE (amplitude);
 
+-- alert rebuild scans only the hits; separator probes use the full index above
+CREATE INDEX IF NOT EXISTS readings_device_hits_idx
+    ON readings (device_id, event_time, sample_id)
+    INCLUDE (amplitude)
+    WHERE verdict = 'hit';
+
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id          TEXT        NOT NULL,           -- sample_id of first hit
     device_id         TEXT        NOT NULL,

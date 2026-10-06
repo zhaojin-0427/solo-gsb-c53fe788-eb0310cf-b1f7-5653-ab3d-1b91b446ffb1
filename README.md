@@ -39,9 +39,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET /healthz` | 健康检查 |
 
 游标用法：首次 `cursor=0`，之后把上一次响应的 `next_cursor` 原样带回；
-`has_more=true` 表示后面还有数据。告警按事件时间排序；仅当**相邻两条读数均命中且
-间隔不超过 5 分钟（含 300 秒，中间没有非命中读数）**时才合并，告警 ID 取该段首个
-命中读数的采样 ID。
+`has_more=true` 表示后面还有数据。告警按事件时间排序；仅当**相邻两条命中读数在
+全序 `(event_time, sample_id)` 中紧邻、间隔不超过 5 分钟（含 300 秒）、且中间没有
+任何非命中（normal/unknown）读数**时才合并，告警 ID 取该段首个命中读数的采样 ID。
+同一事件秒内按 `sample_id` 判定相邻。
 
 ## 三、实际请求 / 响应示例（均可直接复现）
 
@@ -143,6 +144,87 @@ curl -s 'http://localhost:8000/alerts?device_id=pump-7'
 若两次命中相隔超过 5 分钟（>300 秒）或中间夹了非命中读数，则分成两条告警，
 各自的 `alert_id` 为该段首个命中读数的采样 ID。
 
+### 4b) 中间夹 normal → 必须拆成两条告警（误合并修复点）
+
+在 `s00`–`s20` 之后，依次上报 `h1`（00:01:00，9.0 → hit）、`sep`（00:01:30，
+1.0 → normal）、`h2`（00:02:00，9.0 → hit）。两条 hit 只相隔 60 秒，但全序
+`(event_time, sample_id)` 中夹着一条 normal，**不能合并**：
+
+```bash
+curl -s -X POST http://localhost:8000/readings -H 'Content-Type: application/json' \
+  -d '{"device_id":"pump-7","readings":[
+    {"sample_id":"h1","rev":0,"event_time":"2026-10-01T00:01:00Z","amplitude":9.0},
+    {"sample_id":"sep","rev":0,"event_time":"2026-10-01T00:01:30Z","amplitude":1.0},
+    {"sample_id":"h2","rev":0,"event_time":"2026-10-01T00:02:00Z","amplitude":9.0}]}'
+
+curl -s 'http://localhost:8000/alerts?device_id=pump-7'
+```
+
+```json
+{"alerts":[
+  {"alert_id":"h1","device_id":"pump-7","first_sample_id":"h1","last_sample_id":"h1",
+   "starts_at":"2026-10-01T00:01:00Z","ends_at":"2026-10-01T00:01:00Z",
+   "hit_count":1,"max_amplitude":9.0,"updated_at":"…"},
+  {"alert_id":"h2","device_id":"pump-7","first_sample_id":"h2","last_sample_id":"h2",
+   "starts_at":"2026-10-01T00:02:00Z","ends_at":"2026-10-01T00:02:00Z",
+   "hit_count":1,"max_amplitude":9.0,"updated_at":"…"}
+]}
+```
+
+变更流里是两条独立的 `created`（`GET /changes?device_id=pump-7&cursor=0`）：
+
+```json
+{"changes":[
+  {"id":1,"device_id":"pump-7","alert_id":"h1","op":"created","changed_at":"…",
+   "data":{"alert_id":"h1","first_sample_id":"h1","last_sample_id":"h1",
+           "hit_count":1,"max_amplitude":9.0,"…":"…"}},
+  {"id":2,"device_id":"pump-7","alert_id":"h2","op":"created","changed_at":"…",
+   "data":{"alert_id":"h2","first_sample_id":"h2","last_sample_id":"h2",
+           "hit_count":1,"max_amplitude":9.0,"…":"…"}}],
+ "next_cursor":2,"has_more":false}
+```
+
+反之，若先有两条相邻 hit 合并，之后再补进一条夹在中间的 normal（新读数或高修订
+改写），已合并的告警会**拆段**：首段保留原 `alert_id` 并发 `updated`（末读数 /
+计数 / 峰值收缩），后续各段以各自首个 hit 为 ID 发 `created`。
+
+### 4c) 高修订把分隔读数改成 hit → 重新合并，变更流记录更新与撤销
+
+承接 4b，用更高修订把 `sep` 改成 9.0（变为 hit）。三条命中在全序上紧邻、两两
+间隔 ≤300 秒，重新合并为一条以首个 hit `h1` 为 ID 的告警；原来独立的 `h2`
+告警被撤销：
+
+```bash
+curl -s -X POST http://localhost:8000/readings -H 'Content-Type: application/json' \
+  -d '{"device_id":"pump-7","readings":[
+    {"sample_id":"sep","rev":1,"event_time":"2026-10-01T00:01:30Z","amplitude":9.0}]}'
+```
+
+```json
+{"device_id":"pump-7","results":[
+  {"sample_id":"sep","rev":1,"event_time":"2026-10-01T00:01:30Z","amplitude":9.0,
+   "status":"accepted","baseline":1.0,"verdict":"hit"}]}
+```
+
+`GET /alerts` 只剩一条：
+
+```json
+{"alerts":[
+  {"alert_id":"h1","device_id":"pump-7","first_sample_id":"h1","last_sample_id":"h2",
+   "starts_at":"2026-10-01T00:01:00Z","ends_at":"2026-10-01T00:02:00Z",
+   "hit_count":3,"max_amplitude":9.0,"updated_at":"…"}]}
+```
+
+`GET /changes?device_id=pump-7&cursor=0` 按游标顺序完整记录
+**新增 → 更新 → 撤销**（撤销载荷为该告警消失前的最后快照）：
+
+```text
+id=1  h1 created  (h1..h1, count=1)
+id=2  h2 created  (h2..h2, count=1)
+id=3  h1 updated  (h1..h2, count=3)
+id=4  h2 revoked  (h2..h2, count=1)
+```
+
 ### 5) 查看变更（游标续读）
 
 ```bash
@@ -217,18 +299,24 @@ created(s23)`。
 
 ## 四、性能
 
-单设备累计 10 万条读数后，100 条纯追加批次在本地 PostgreSQL 15（fsync=off）实测
-延迟：最小 54 ms、中位 56 ms、**P95 71 ms**（要求 P95 ≤ 1 s）。10 万条初始灌入
-约 29 秒（每批 1000）。
+单设备累计 10 万条读数（全为 normal）后，100 条纯追加批次在本地 PostgreSQL 15
+（fsync=off）实测延迟：最小 29 ms、中位 31 ms、**P95 47 ms**（要求 P95 ≤ 1 s）。
+10 万条初始灌入约 43 秒（每批 1000）。
 
-实现要点：
+实现要点（在"分隔准确"与"追加低延迟"之间的取舍）：
 
-- 基线重算用**滑动窗口双堆 + 惰性删除**，对时间轴做一次 O(n log n) 扫描，避免对
-  每条读数单独做窗口聚合；
+- 基线重算用**滑动窗口双堆 + 惰性删除**，对受影响时间轴做一次 O(n log n) 扫描
+  （重算范围 = 新旧改动位置的并集到其后 60 分钟），避免对每条读数单独做窗口聚合；
+- 告警重建若每次都在 Python 里扫描设备全部读数，追加成本会随历史 O(n) 增长。
+  实际做法是只经 **hit 部分索引**取命中序列，再对"间隔 ≤ 5 分钟的相邻 hit 对"
+  用**一条成批 `EXISTS` 查询**探测二者在全序 `(event_time, sample_id)` 之间是否
+  存在非命中读数（命中序列中二者相邻，夹着的行必为 normal/unknown）。每对探测
+  范围被 ≤300 秒的时距夹住，追加成本只与邻近命中数量有关、与历史总量无关；
 - 每设备在事务内 `pg_advisory_xact_lock(hashtextextended(device_id,0))` 串行化，
   并发批次不丢数据，重试不重复发变更；
 - 批量写入走 psycopg3 pipeline；关键索引：
-  `readings(device_id,event_time,sample_id) INCLUDE (amplitude)`、
+  `readings(device_id,event_time,sample_id) INCLUDE (amplitude)` 及其
+  `WHERE verdict='hit'` 部分索引、
   `alerts(device_id,starts_at,alert_id)`、`changes(id)`。
 
 ## 五、测试
@@ -241,8 +329,10 @@ BASE_URL=http://localhost:8000 pytest tests/ -s
 
 - `tests/test_sliding_median.py`：滑动窗口中位数与 `statistics.median` 的随机对照
   （含重复值、窗口左右边界）；
-- `tests/test_api.py`：基线未知 / 命中、严格 3 倍、5 分钟合并与分裂、旧修订忽略、
-  等修订冲突整批回滚、重试幂等、更正重算与撤销、游标续读、输入校验，以及
+- `tests/test_api.py`：基线未知 / 命中、严格 3 倍、5 分钟合并与分裂、
+  **中间夹 normal/unknown 拆分、补插分隔读数拆分已合并告警、高修订改分隔读数为
+  hit 后重新合并与撤销、同秒按 sample_id 判邻**、旧修订忽略、等修订冲突整批
+  回滚、重试幂等、更正重算与撤销、游标续读、输入校验，以及
   10 万条 + 追加批次 P95 性能基准。
 
 ## 六、数据模型

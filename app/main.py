@@ -299,12 +299,36 @@ def _recompute_baselines(conn: Connection, device_id: str,
     return out
 
 
-def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dict]:
-    """Rebuild all current alerts for one device from its hit verdicts.
+def _alert_snapshot(run: dict, device_id: str, updated_at: datetime) -> dict:
+    return {
+        "alert_id": run["alert_id"],
+        "device_id": device_id,
+        "first_sample_id": run["first_sample_id"],
+        "last_sample_id": run["last_sample_id"],
+        "starts_at": iso(run["starts_at"]),
+        "ends_at": iso(run["ends_at"]),
+        "hit_count": run["hit_count"],
+        "max_amplitude": run["max_amplitude"],
+        "updated_at": iso(updated_at),
+    }
 
-    Hits ordered by event time (sample_id as tie-break) form runs; adjacent hits
-    more than 5 minutes apart split runs. An alert id is the first hit's
-    sample id. Emits created/updated/revoked change rows for the diff.
+
+def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[tuple]:
+    """Rebuild all current alerts for one device from its current verdicts.
+
+    Two hits belong to the same alert iff they are adjacent in the device's
+    total reading order (event_time, then sample_id within the same second),
+    their event times differ by at most MERGE_GAP (300 s included), **and no
+    reading at all lies between them** — an intervening normal/unknown reading
+    splits the run. An alert id is the first hit's sample id.
+
+    Implementation choice: the hits come from the partial hit index, and for
+    each adjacent hit pair close enough to merge we probe whether any reading
+    sits strictly between the pair in total order. The probes are one batched
+    EXISTS query whose range per pair is bounded by the <= 300 s gap, so the
+    append-path cost depends on the number of nearby hits rather than on the
+    device's full history (a full-sequence Python scan would scale O(n) with
+    every write). Emits created/updated/revoked change rows for the diff.
     """
     hits = conn.execute(
         """
@@ -316,9 +340,58 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
         (device_id,),
     ).fetchall()
 
+    # Batched separator probe: for every adjacent hit pair within MERGE_GAP,
+    # ask whether any reading is strictly between them in total order. Such a
+    # reading cannot itself be a hit (the pair is adjacent among hits), so a
+    # found row is necessarily normal/unknown.
+    pairs = [
+        (
+            hits[i]["event_time"], hits[i]["sample_id"],
+            hits[i + 1]["event_time"], hits[i + 1]["sample_id"],
+        )
+        for i in range(len(hits) - 1)
+        if hits[i + 1]["event_time"] - hits[i]["event_time"] <= MERGE_GAP
+    ]
+    separated: set[int] = set()
+    if pairs:
+        rows = conn.execute(
+            """
+            WITH p(t1, s1, t2, s2, idx) AS (
+                SELECT *
+                  FROM unnest(%s::TIMESTAMPTZ[], %s::TEXT[],
+                              %s::TIMESTAMPTZ[], %s::TEXT[]) WITH ORDINALITY
+            )
+            SELECT p.idx
+              FROM p
+             WHERE EXISTS (
+                SELECT 1
+                  FROM readings r
+                 WHERE r.device_id = %s
+                   AND (r.event_time, r.sample_id) > (p.t1, p.s1)
+                   AND (r.event_time, r.sample_id) < (p.t2, p.s2))
+            """,
+            ([p[0] for p in pairs], [p[1] for p in pairs],
+             [p[2] for p in pairs], [p[3] for p in pairs], device_id),
+        ).fetchall()
+        separated = {r["idx"] - 1 for r in rows}
+
+    # Boundary k (between hits[k-1] and hits[k], k >= 1) is probed only when
+    # the gap is <= MERGE_GAP; probe_pos[k] is its index in `pairs`, else -1.
+    probe_pos = [-1] * len(hits)
+    seq = 0
+    for k in range(1, len(hits)):
+        if hits[k]["event_time"] - hits[k - 1]["event_time"] <= MERGE_GAP:
+            probe_pos[k] = seq
+            seq += 1
+
     runs: list[dict] = []
-    for h in hits:
-        if runs and h["event_time"] - runs[-1]["ends_at"] <= MERGE_GAP:
+    for k, h in enumerate(hits):
+        split = (
+            k == 0
+            or probe_pos[k] < 0
+            or probe_pos[k] in separated
+        )
+        if not split:
             run = runs[-1]
             run["last_sample_id"] = h["sample_id"]
             run["ends_at"] = h["event_time"]
@@ -335,7 +408,6 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
                 "max_amplitude": float(h["amplitude"]),
             })
 
-    current = {r["alert_id"]: r for r in runs}
     existing_rows = conn.execute(
         "SELECT * FROM alerts WHERE device_id = %s ORDER BY starts_at, alert_id",
         (device_id,),
@@ -344,51 +416,25 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
 
     compare_fields = ("first_sample_id", "last_sample_id", "starts_at",
                       "ends_at", "hit_count", "max_amplitude")
+
+    current_ids = {run["alert_id"] for run in runs}
+    revoked = [r for r in existing_rows if r["alert_id"] not in current_ids]
+    upserts: list[tuple] = []
     changes: list[tuple] = []
 
-    for alert_id, old in existing.items():
-        if alert_id not in current:
-            changes.append((device_id, alert_id, "revoked", now, {
-                "alert_id": alert_id,
-                "device_id": device_id,
-                "first_sample_id": old["first_sample_id"],
-                "last_sample_id": old["last_sample_id"],
-                "starts_at": iso(old["starts_at"]),
-                "ends_at": iso(old["ends_at"]),
-                "hit_count": old["hit_count"],
-                "max_amplitude": old["max_amplitude"],
-                "updated_at": iso(old["updated_at"]),
-            }))
-    if changes:
-        conn.execute(
-            "DELETE FROM alerts WHERE device_id = %s", (device_id,))
-
-    upserts: list[tuple] = []
+    # Create/update first (in event-time run order), then revocations: an alert
+    # id is either created/updated or revoked in one rebuild, never both, so
+    # the stream stays replay-safe for stateful consumers.
     for run in runs:
         old = existing.get(run["alert_id"])
-        upserts.append((
-            run["alert_id"], device_id, run["first_sample_id"],
-            run["last_sample_id"], run["starts_at"], run["ends_at"],
-            run["hit_count"], run["max_amplitude"], now,
-        ))
         if old is None:
-            op = "created"
+            upserts.append(_alert_upsert_tuple(run, device_id, now))
+            changes.append((device_id, run["alert_id"], "created", now,
+                            _alert_snapshot(run, device_id, now)))
         elif any(run[f] != old[f] for f in compare_fields):
-            op = "updated"
-        else:
-            op = None
-        if op:
-            changes.append((device_id, run["alert_id"], op, now, {
-                "alert_id": run["alert_id"],
-                "device_id": device_id,
-                "first_sample_id": run["first_sample_id"],
-                "last_sample_id": run["last_sample_id"],
-                "starts_at": iso(run["starts_at"]),
-                "ends_at": iso(run["ends_at"]),
-                "hit_count": run["hit_count"],
-                "max_amplitude": run["max_amplitude"],
-                "updated_at": iso(now),
-            }))
+            upserts.append(_alert_upsert_tuple(run, device_id, now))
+            changes.append((device_id, run["alert_id"], "updated", now,
+                            _alert_snapshot(run, device_id, now)))
 
     if upserts:
         _bulk(conn,
@@ -408,12 +454,37 @@ def _rebuild_alerts(conn: Connection, device_id: str, now: datetime) -> list[dic
             """,
             upserts)
 
+    if revoked:
+        _bulk(conn,
+              "DELETE FROM alerts WHERE device_id = %s AND alert_id = %s",
+              [(device_id, r["alert_id"]) for r in revoked])
+        for old in revoked:
+            run_view = {
+                "alert_id": old["alert_id"],
+                "first_sample_id": old["first_sample_id"],
+                "last_sample_id": old["last_sample_id"],
+                "starts_at": old["starts_at"],
+                "ends_at": old["ends_at"],
+                "hit_count": old["hit_count"],
+                "max_amplitude": float(old["max_amplitude"]),
+            }
+            changes.append((device_id, old["alert_id"], "revoked", now,
+                            _alert_snapshot(run_view, device_id, old["updated_at"])))
+
     if changes:
         _bulk(conn,
               "INSERT INTO changes (device_id, alert_id, op, changed_at, data) "
               "VALUES (%s, %s, %s, %s, %s)",
               [(d, a, op, ts, Json(payload)) for d, a, op, ts, payload in changes])
     return changes
+
+
+def _alert_upsert_tuple(run: dict, device_id: str, now: datetime) -> tuple:
+    return (
+        run["alert_id"], device_id, run["first_sample_id"],
+        run["last_sample_id"], run["starts_at"], run["ends_at"],
+        run["hit_count"], run["max_amplitude"], now,
+    )
 
 
 @app.post("/readings")
@@ -451,6 +522,10 @@ def post_readings(batch: BatchIn):
             to_insert: list[tuple] = []
             to_update: list[tuple] = []
             applied_times: list[datetime] = []
+            # Old positions of revised readings: deleting them can change the
+            # verdicts of the 60 minutes following the old position, so the
+            # recompute window must cover those too.
+            prior_times: list[datetime] = []
             conflict = False
 
             for item in items:
@@ -492,6 +567,7 @@ def post_readings(batch: BatchIn):
                 else:
                     to_update.append((item.rev, t, a, device_id, item.sample_id))
                     applied_times.append(t)
+                    prior_times.append(old["event_time"])
                     results.append(base | {"status": "accepted",
                                            "baseline": None, "verdict": None})
 
@@ -520,8 +596,9 @@ def post_readings(batch: BatchIn):
 
             recomputed: dict[str, tuple[Optional[float], str]] = {}
             if applied_times:
-                lo = min(applied_times)
-                hi = max(applied_times) + WINDOW
+                affected_times = applied_times + prior_times
+                lo = min(affected_times)
+                hi = max(affected_times) + WINDOW
                 recomputed = _recompute_baselines(conn, device_id, lo, hi)
 
             for r in results:
